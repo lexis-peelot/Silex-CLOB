@@ -1,0 +1,352 @@
+// Central Limit Order Book (CLOB) DEX Contract for XELIS
+// Permissionless, trustless, distributed, MEV resistant
+// Supports any asset pair dynamically
+// MEV-Resistant: ALL orders executed at block end in fair price-priority order
+// Gas paid by users, unused gas automatically refunded by the protocol
+// by: Peelot
+
+const NULL = b''
+const PRICE_SCALE: u64 = 10**12  // 12 decimals
+const GAS_PER_ORDER: u64 = 50000  // Gas contribution per delayed order, TODO: tune
+
+// Order structure stored in btree values
+struct Order {
+    id: u64,
+    maker: Address,
+    rem_offered: u64,
+    expiry: u64  // topoheight at which order expires; 0 = never expires
+}
+
+// Pending order for delayed execution (stored in memory)
+struct PendingOrder {
+    maker: Address,
+    asset_offered: Hash,
+    asset_wanted: Hash,
+    amount_offered: u64,
+    price: u128,
+    place_on_book: bool,
+    expiry: u64,  // 0 = never
+    sort_key: bytes  // Precomputed at insertion: phase + desc_price
+}
+
+// Build sort key: place_on_book (phase) + price
+// - Phase 1: place_on_book=true orders (takers that place remainder on book)
+// - Phase 0: place_on_book=false orders (takers that refund remainder)
+// - Sorted descending: Phase 1 first, then Phase 0; within each phase, descending price (highest first)
+fn build_sort_key(place_on_book: bool, price: u128) -> bytes {
+    let phase = place_on_book as u8
+    return phase.to_be_bytes() + price.to_be_bytes()
+}
+
+// Unfillable = no integer give exists such that 1 <= floor(give*R/price) <= rem
+fn is_unfillable(rem: u64, price: u128) -> bool {
+    if rem == 0 { return true }
+    let r: u256 = PRICE_SCALE as u256
+    let p: u256 = price as u256
+
+    // For price >= R, min_give > 1 but min receive is always exactly 1 => fillable for any rem>=1
+    if p >= r { return false }
+
+    // price < R => min_give = 1. Unfillable iff floor(R/p) > rem  <=>  R >= (rem+1)*p
+    return r >= (rem as u256 + 1) * p
+}
+
+// Get next order ID (auto-initializes to 1 if not set)
+fn get_next_order_id(storage: Storage) -> u64 {
+    let next_id: u64 = storage.load("order_id").unwrap_or(1)
+    storage.store("order_id", next_id + 1)
+    return next_id
+}
+
+// Get or create a pair ID for an asset pair (order matters: offered->wanted)
+fn get_or_create_pair_id(storage: Storage, asset_offered: Hash, asset_wanted: Hash) -> u32 {
+    let existing: optional<u32> = storage.load(("pair", asset_offered, asset_wanted))
+    let pair_id: u32 = existing.unwrap_or(storage.load("next_pair_id").unwrap_or(0))
+    if existing.is_none() {
+        storage.store(("pair", asset_offered, asset_wanted), pair_id)
+        storage.store("next_pair_id", pair_id + 1)
+    }
+    return pair_id
+}
+
+// Record a trade in memory for later flush to storage
+fn record_trade(mem: MemoryStorage, pair_id: u32, give: u64, receive: u64) {
+    let trades: map<u32, bytes> = mem.load("H").unwrap_or({})
+    let existing: bytes = trades.get(pair_id).unwrap_or(b'')
+    trades.insert(pair_id, existing + give.to_be_bytes() + receive.to_be_bytes())
+    mem.store("H", trades)
+}
+
+// Flush trade history to permanent storage
+// Each write creates a version with previous_topoheight linking to prior version.
+// Use get_contract_data RPC to get latest + previous_topoheight, then follow the
+// chain via get_contract_data_at_topoheight to walk back through trade history.
+fn flush_trade_history(mem: MemoryStorage) {
+    let trades: map<u32, bytes> = mem.load("H").unwrap_or({})
+    let storage = Storage::new()
+    let keys = trades.keys()
+    for i: u32 = 0; i < keys.len(); i += 1 {
+        storage.store(("H", keys[i]), trades.get(keys[i]).unwrap())
+    }
+}
+
+// Matches a pending order against existing counter-orders (opposite direction) in the order book.
+// Iterates through counter orders in ascending price order (best prices first) and greedily fills
+// as much as possible from each compatible order. Executes transfers for each match and records trades.
+// Returns the remaining amount of the pending order that could not be matched.
+// Note: This function does not pre-check fillability constraints (is_unfillable) before attempting
+// matches - it relies on the greedy matching logic and only checks fillability when updating maker
+// orders after partial fills. This "relaxed" approach allows maximum fill efficiency.
+fn match_orders(mem: MemoryStorage, pending: PendingOrder) -> u64 {
+    let storage = Storage::new()
+
+    // Check if counter book exists (orders in opposite direction: wanted->offered)
+    // If no counter book exists, there are no orders to match against, so return full amount
+    let counter_pair_id: optional<u32> = storage.load(("pair", pending.asset_wanted, pending.asset_offered))
+    if counter_pair_id.is_none() {
+        return pending.amount_offered
+    }
+
+    let counter_tree = BTreeStore::new(counter_pair_id.unwrap().to_be_bytes())
+    let (cursor, current) = counter_tree.seek(NULL, BTreeSeekBias::First, true)
+
+    let now = get_current_topoheight()
+    let remaining = pending.amount_offered
+
+    while remaining > 0 && current.is_some() {
+        let node = current.unwrap()
+        let counter_price = u128::from_be_bytes(node.key.slice(0..16))
+        let order = node.value as Order
+
+        // Handle expired maker orders: refund remaining amount and remove from book
+        if order.expiry != 0 && order.expiry <= now {
+            require(transfer(order.maker, order.rem_offered, pending.asset_wanted), "transfer failed")
+            cursor.delete()
+            current = cursor.next()
+            continue
+        }
+
+        // Price compatibility check: pending.price * counter_price <= PRICE_SCALE^2 means prices overlap
+        // Since we traverse in ascending price order, once this fails, all remaining orders will also
+        // be incompatible, so we can break early (monotonic property)
+        if (pending.price as u256 * counter_price as u256) > (PRICE_SCALE as u256 * PRICE_SCALE as u256) {
+            break
+        }
+
+        // Calculate maximum fill: determine how much we can receive given remaining amount and counter price
+        // Formula: max_receive = (remaining * PRICE_SCALE) / counter_price
+        let r = PRICE_SCALE as u256
+        let p = counter_price as u256
+
+        let max_receive = (remaining as u256 * r) / p
+        if max_receive == 0 {
+            break
+        }
+
+        // Take the minimum of what we can receive and what the maker order has available
+        let receive_u256 = (max_receive > order.rem_offered as u256)
+            ? order.rem_offered as u256
+            : max_receive
+        let receive = receive_u256 as u64
+
+        // Calculate how much we need to give: ceil(receive * counter_price / PRICE_SCALE)
+        // Using ceiling ensures we never underpay the maker
+        let give = ((receive_u256 * p + r - 1) / r) as u64
+
+        // Execute trade: transfer assets between taker (pending.maker) and maker (order.maker)
+        // Taker receives 'receive' of wanted asset, maker receives 'give' of offered asset
+        require(transfer(pending.maker, receive, pending.asset_wanted), "transfer failed")
+        require(transfer(order.maker, give, pending.asset_offered), "transfer failed")
+        remaining -= give
+
+        // Record trade (create pair id only if a trade actually happens)
+        let my_pair_id = get_or_create_pair_id(storage, pending.asset_offered, pending.asset_wanted)
+        record_trade(mem, my_pair_id, give, receive)
+
+        // Update maker order:
+        // If partially filled, check if remainder is still fillable; if not, refund to maker, otherwise update book
+        cursor.delete()
+        let new_rem = order.rem_offered - receive
+        if new_rem > 0 {
+            if is_unfillable(new_rem, counter_price) {
+                // Remainder too small to ever be filled, refund to maker
+                require(transfer(order.maker, new_rem, pending.asset_wanted), "transfer failed")
+            } else {
+                // Remainder is still fillable, update order in book with new remaining amount
+                let updated = Order {
+                    id: order.id,
+                    maker: order.maker,
+                    rem_offered: new_rem,
+                    expiry: order.expiry
+                }
+                counter_tree.insert(counter_price.to_be_bytes() + order.id.to_be_bytes(), updated)
+            }
+        }
+
+        current = cursor.next()
+    }
+
+    return remaining
+}
+
+// Process a single order in batch execution
+// Slippage protection comes from price-priority ordering instead.
+fn process_single_order(mem: MemoryStorage, order: PendingOrder) {
+    // Match against counter-orders
+    let remaining = match_orders(mem, order)
+    
+    // Handle remainder
+    if remaining > 0 {
+        if order.place_on_book && !is_unfillable(remaining, order.price) {
+            let storage = Storage::new()
+            let pair_id = get_or_create_pair_id(storage, order.asset_offered, order.asset_wanted)
+            let order_id = get_next_order_id(storage)
+            let new_order = Order {
+                id: order_id,
+                maker: order.maker,
+                rem_offered: remaining,
+                expiry: order.expiry
+            }
+            let bt = BTreeStore::new(pair_id.to_be_bytes())
+            bt.insert(order.price.to_be_bytes() + order_id.to_be_bytes(), new_order)
+        } else {
+            require(transfer(order.maker, remaining, order.asset_offered), "transfer failed")
+        }
+    }
+}
+
+// Cancel orders in one tree
+fn cancel_orders(order_id: optional<u64>, caller: Address, offered: Hash, wanted: Hash) -> bool {
+    let storage = Storage::new()
+    let pair_id: optional<u32> = storage.load(("pair", offered, wanted))
+    let found = false
+    
+    if pair_id.is_some() {
+        let tree = BTreeStore::new(pair_id.unwrap().to_be_bytes())
+        let (cursor, current) = tree.seek(NULL, BTreeSeekBias::First, true)
+        
+        while current.is_some() {
+            let node = current.unwrap()
+            let order = node.value as Order
+            
+            if order.maker == caller && (order_id.is_none() || order.id == order_id.unwrap()) {
+                require(transfer(caller, order.rem_offered, offered), "transfer failed")
+                cursor.delete()
+                found = true
+                if order_id.is_some() {
+                    break
+                }
+            }
+            
+            current = cursor.next()
+        }
+    }
+    return found
+}
+
+// Block-end execution function: process all pending orders sorted by price
+fn execute_batch() -> u64 {
+    let mem = MemoryStorage::new(true)
+    
+    let pending_count: u32 = mem.load("pending_count").unwrap_or(0)
+    if pending_count > 0 {
+        // Load all pending orders into array
+        let orders: PendingOrder[] = []
+        for i: u32 = 0; i < pending_count; i += 1 {
+            orders.push(mem.load(("pending", i)).unwrap())
+        }
+        
+        // Sort by precomputed key: phase (place_on_book first) then descending price - O(n log n)
+        orders.sort_by_key(|o: PendingOrder| { return o.sort_key }, false)
+        
+        // Process all orders in sorted order
+        for i: u32 = 0; i < orders.len(); i += 1 {
+            let order = orders[i]
+            process_single_order(mem, order)
+        }
+        
+        flush_trade_history(mem)
+    }
+    
+    return 0
+}
+
+// ============================================================================
+// ORDER PLACEMENT (All orders use delayed batch execution for MEV resistance)
+// ============================================================================
+
+// Place an order - executed at block end with all other orders for MEV resistance
+// Caller must deposit exactly one asset (the offered asset) with this call.
+// Price is derived from the ratio: price = amount_wanted / amount_deposited (scaled by PRICE_SCALE)
+// Orders are sorted by price (highest first) to ensure fair ordering within each batch.
+// GAS_PER_ORDER must be included over and above normal transaction gas to fund batch execution.
+
+entry Order(asset_wanted: Hash, amount_wanted: u64, place_on_book: bool, expiry: optional<u64>) {
+    let maker = get_caller().unwrap()
+    let now = get_current_topoheight()
+    let deposits = get_deposits()
+    require(deposits.len() == 1, "Must deposit exactly one asset")
+    let asset_offered = deposits.keys()[0]
+    let amount_offered = deposits.values()[0]
+    require(amount_offered > 0, "Deposit amount must be greater than zero")
+    require(amount_wanted > 0, "Amount wanted must be greater than zero")
+    require(asset_offered != asset_wanted, "Cannot trade asset for itself")
+    require(Asset::get_by_hash(asset_wanted).is_some(), "Asset wanted does not exist")
+    let exp: u64 = expiry.unwrap_or(0)
+    require(exp == 0 || exp > now, "Expiry must be in the future")
+    let price: u128 = (amount_wanted as u128 * PRICE_SCALE as u128 + amount_offered as u128 - 1) / amount_offered as u128
+    require(price > 0, "Price too small - increase amount_wanted or decrease deposit")
+    
+    // Use persistent memory storage (survives to block end)
+    let mem = MemoryStorage::new(true)
+    
+    // Add pending order
+    let count: u32 = mem.load("pending_count").unwrap_or(0)
+    mem.store(("pending", count), PendingOrder {
+        maker: maker,
+        asset_offered: asset_offered,
+        asset_wanted: asset_wanted,
+        amount_offered: amount_offered,
+        price: price,
+        place_on_book: place_on_book,
+        expiry: exp,
+        sort_key: build_sort_key(place_on_book, price)
+    })
+    mem.store("pending_count", count + 1)
+    
+    // Each order contributes GAS_PER_ORDER to block-end execution
+    // Unused gas is automatically refunded to users by the protocol
+    let scheduled = ScheduledExecution::get_pending(null)
+    let success = (scheduled.is_none())
+        ? ScheduledExecution::new_at_block_end(execute_batch, [], GAS_PER_ORDER, false).is_some()
+        : scheduled.unwrap().increase_max_gas(GAS_PER_ORDER, false)
+    require(success, "Insufficient gas - include at least GAS_PER_ORDER extra in your transaction")
+    
+    return 0
+}
+
+// ============================================================================
+// CANCEL OPERATIONS
+// ============================================================================
+
+// Cancel a specific order by ID (only works for orders ON THE BOOK)
+// Pending orders in the current block CANNOT be cancelled - this is intentional
+// for MEV resistance: once submitted, you're committed until block end.
+// This prevents block producers from seeing all orders then cancelling their own.
+
+entry Cancel(order_id: u64, asset1: Hash, asset2: Hash) {
+    let caller = get_caller().unwrap()
+    require(
+        cancel_orders(order_id, caller, asset1, asset2) ||
+        cancel_orders(order_id, caller, asset2, asset1),
+        "Order not found"
+    )
+    return 0
+}
+
+// Cancel all orders where caller is offering asset_offered for asset_wanted
+entry CancelAll(asset_offered: Hash, asset_wanted: Hash) {
+    let caller = get_caller().unwrap()
+    cancel_orders(null, caller, asset_offered, asset_wanted)
+    return 0
+}
