@@ -10,6 +10,7 @@ A permissionless, trustless, distributed decentralized exchange (DEX) contract f
 - **Gas Efficient**: Users pay gas, unused gas automatically refunded by the protocol
 - **Order Expiry**: Optional expiry topoheight for time-limited orders
 - **Trade History**: Permanent on-chain trade history with versioned storage
+- **Real-Time Ticker**: WebSocket events for real-time trade updates
 
 ## How It Works
 
@@ -154,6 +155,13 @@ Trade history is stored in versioned storage:
 - Each block creates a new version with `previous_topoheight` linking
 - Use `get_contract_data` RPC to get latest version
 - Follow `previous_topoheight` chain via `get_contract_data_at_topoheight` to walk back through history
+
+### Real-Time Ticker
+
+The contract fires events for each executed trade, which can be subscribed to via WebSocket:
+- Event ID `1`: Trade Execution
+- Contains: `asset_offered`, `asset_wanted`, `amount_give`, `amount_receive`
+- Events are sent only for successfully executed blocks (reorg-safe)
 
 ### Gas Model
 

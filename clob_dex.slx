@@ -1,5 +1,6 @@
 // Central Limit Order Book (CLOB) DEX Contract for XELIS
 // Permissionless, trustless, distributed, MEV resistant
+// Ver 0.1
 // Supports any asset pair dynamically
 // MEV-Resistant: ALL orders executed at block end in fair price-priority order
 // Gas paid by users, unused gas automatically refunded by the protocol
@@ -8,6 +9,17 @@
 const NULL = b''
 const PRICE_SCALE: u64 = 10**12  // 12 decimals
 const GAS_PER_ORDER: u64 = 50000  // Gas contribution per delayed order, TODO: tune
+
+// Event IDs
+const EVENT_TRADE: u64 = 1  // Fired when a trade executes. Data: TradeEvent
+
+// Event fired on trade execution
+struct TradeEvent {
+    asset_offered: Hash,
+    asset_wanted: Hash,
+    amount_give: u64,
+    amount_receive: u64
+}
 
 // Order structure stored in btree values
 struct Order {
@@ -162,6 +174,14 @@ fn match_orders(mem: MemoryStorage, pending: PendingOrder) -> u64 {
         // Record trade (create pair id only if a trade actually happens)
         let my_pair_id = get_or_create_pair_id(storage, pending.asset_offered, pending.asset_wanted)
         record_trade(mem, my_pair_id, give, receive)
+
+        // Fire ticker event
+        fire_event(EVENT_TRADE, TradeEvent {
+            asset_offered: pending.asset_offered,
+            asset_wanted: pending.asset_wanted,
+            amount_give: give,
+            amount_receive: receive
+        })
 
         // Update maker order:
         // If partially filled, check if remainder is still fillable; if not, refund to maker, otherwise update book
