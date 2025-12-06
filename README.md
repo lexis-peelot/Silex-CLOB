@@ -8,6 +8,7 @@ A permissionless, trustless, distributed decentralized exchange (DEX) contract f
 - **Permissionless**: Supports any asset pair dynamically - no whitelisting required
 - **Trustless**: Fully on-chain execution with no intermediaries
 - **Gas Efficient**: Users pay gas, unused gas automatically refunded by the protocol
+- **Integrator Fees**: Front-end providers can earn fees on trades routed through their interface
 - **Order Expiry**: Optional expiry topoheight for time-limited orders
 - **Trade History**: Permanent on-chain trade history with versioned storage
 - **Real-Time Ticker**: WebSocket events for real-time trade updates
@@ -50,6 +51,7 @@ Place a new order for delayed batch execution.
 - `amount_wanted: u64` - The amount of `asset_wanted` you want to receive
 - `place_on_book: bool` - If true, unmatched remainder is placed on the order book; if false, remainder is refunded
 - `expiry: optional<u64>` - Optional topoheight at which order expires (0 = never expires)
+- `integrator: optional<(Address, u16)>` - Optional integrator fee: (recipient address, fee in basis points 1-5000)
 
 **Deposits:**
 - Must deposit exactly one asset (the asset you're offering)
@@ -67,13 +69,14 @@ price = (amount_wanted * PRICE_SCALE + amount_offered - 1) / amount_offered
 
 **Example:**
 ```rust
-// Offer 1000 XELIS for 500 USDT
+// Offer 1000 XELIS for 500 USDT with 1% integrator fee
 // Deposit: 1000 XELIS
 Order(
     asset_wanted: USDT_HASH,
     amount_wanted: 500,
     place_on_book: true,
-    expiry: null  // Never expires
+    expiry: null,
+    integrator: (FRONTEND_ADDRESS, 100)  // 100 bps = 1%
 )
 ```
 
@@ -88,15 +91,6 @@ Cancel a specific order by ID.
 
 **Note:** Only orders already on the book can be cancelled. Pending orders in the current block cannot be cancelled (by design, for MEV resistance).
 
-**Example:**
-```rust
-Cancel(
-    order_id: 12345,
-    asset1: XELIS_HASH,
-    asset2: USDT_HASH
-)
-```
-
 ### `CancelAll`
 
 Cancel all orders where the caller is offering `asset_offered` for `asset_wanted`.
@@ -105,13 +99,40 @@ Cancel all orders where the caller is offering `asset_offered` for `asset_wanted
 - `asset_offered: Hash` - The asset you're offering
 - `asset_wanted: Hash` - The asset you want
 
-**Example:**
-```rust
-CancelAll(
-    asset_offered: XELIS_HASH,
-    asset_wanted: USDT_HASH
-)
-```
+### `WithdrawIntegratorFees`
+
+Withdraw all accumulated integrator fees for the caller.
+
+**Parameters:** None
+
+**Notes:**
+- Withdraws all accumulated fees across all assets
+- Only the address that received the fees can withdraw them
+- Fees accumulate in the contract until withdrawn
+
+## Integrator Fees
+
+Front-end providers and integrators can earn a percentage of trades routed through their interface.
+
+### How It Works
+
+1. **Pass integrator info with orders**: Include `(your_address, fee_bps)` in the `integrator` parameter
+2. **Fee deduction**: When the order trades, the fee is deducted from the *received* amount
+3. **Accumulation**: Fees accumulate in the contract, grouped by recipient address
+4. **Withdrawal**: Call `WithdrawIntegratorFees()` to claim all accumulated fees
+
+### Fee Calculation
+
+- Fee is specified in basis points: 100 bps = 1%
+- Valid range: 1-5000 bps (0.01% to 50%)
+- Fee is calculated as: `fee = (amount * fee_bps) / 10000`
+- Fee is deducted from the asset the trader *receives*
+
+### Example
+
+If a user buys 1000 USDT with an integrator fee of 100 bps (1%):
+- User receives: 990 USDT
+- Integrator earns: 10 USDT (accumulated until withdrawn)
 
 ## Order Execution Flow
 
@@ -124,13 +145,14 @@ CancelAll(
    - Orders are sorted by price (highest first)
    - Each order is processed:
      - Matched against counter-orders in the book
+     - Integrator fees deducted from filled amounts
      - Unmatched remainder either placed on book or refunded
-   - Trade history is flushed to permanent storage
+   - Trade history and integrator fees are flushed to permanent storage
 
 3. **Matching Algorithm**:
    - For each pending order, traverse counter-orders in ascending price order
    - Calculate maximum fill based on price compatibility
-   - Execute transfers for each match
+   - Execute transfers for each match (minus integrator fees)
    - Update or remove maker orders based on remaining amounts
    - Handle expired orders automatically
 
@@ -141,6 +163,12 @@ CancelAll(
 - `PRICE_SCALE = 10^12` (12 decimals)
 - Prices are stored as `u128` values scaled by `PRICE_SCALE`
 - Price formula: `price = (amount_wanted * PRICE_SCALE) / amount_offered`
+
+### Basis Points Scale
+
+- `BPS_SCALE = 10000` (100% = 10000 bps)
+- 1 basis point = 0.01%
+- Fee formula: `fee = (amount * fee_bps) / 10000`
 
 ### Unfillable Orders
 
@@ -188,6 +216,8 @@ This ensures:
 - **Automatic Expiry Handling**: Expired orders are automatically refunded
 - **Price Compatibility Checks**: Only compatible prices can match
 - **Unfillable Detection**: Prevents dust accumulation
+- **Address Validation**: XELIS VM validates all addresses are syntactically valid normal addresses
+- **Fee Bounds**: Integrator fees are bounded to 1-5000 bps (max 50%)
 
 ## Authors
 

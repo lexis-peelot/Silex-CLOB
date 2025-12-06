@@ -9,6 +9,7 @@
 const NULL = b''
 const PRICE_SCALE: u64 = 10**12  // 12 decimals
 const GAS_PER_ORDER: u64 = 50000  // Gas contribution per delayed order, TODO: tune
+const BPS_SCALE: u64 = 10000     // 100% = 10000 basis points
 
 // Event IDs
 const EVENT_TRADE: u64 = 1  // Fired when a trade executes. Data: TradeEvent
@@ -26,7 +27,8 @@ struct Order {
     id: u64,
     maker: Address,
     rem_offered: u64,
-    expiry: u64  // topoheight at which order expires; 0 = never expires
+    expiry: u64,  // topoheight at which order expires; 0 = never expires
+    integrator: optional<(Address, u16)>  // (recipient, fee_bps)
 }
 
 // Pending order for delayed execution (stored in memory)
@@ -38,7 +40,8 @@ struct PendingOrder {
     price: u128,
     place_on_book: bool,
     expiry: u64,  // 0 = never
-    sort_key: bytes  // Precomputed at insertion: phase + desc_price
+    sort_key: bytes,  // Precomputed at insertion: phase + desc_price
+    integrator: optional<(Address, u16)>  // (recipient, fee_bps)
 }
 
 // Build sort key: place_on_book (phase) + price
@@ -46,8 +49,7 @@ struct PendingOrder {
 // - Phase 0: place_on_book=false orders (takers that refund remainder)
 // - Sorted descending: Phase 1 first, then Phase 0; within each phase, descending price (highest first)
 fn build_sort_key(place_on_book: bool, price: u128) -> bytes {
-    let phase = place_on_book as u8
-    return phase.to_be_bytes() + price.to_be_bytes()
+    return (place_on_book as u8).to_be_bytes() + price.to_be_bytes()
 }
 
 // Unfillable = no integer give exists such that 1 <= floor(give*R/price) <= rem
@@ -99,6 +101,43 @@ fn flush_trade_history(mem: MemoryStorage) {
     let keys = trades.keys()
     for i: u32 = 0; i < keys.len(); i += 1 {
         storage.store(("H", keys[i]), trades.get(keys[i]).unwrap())
+    }
+}
+
+// Calculate integrator fee, record it, and return net amount
+fn apply_fee(mem: MemoryStorage, integrator: optional<(Address, u16)>, amount: u64, asset: Hash) -> u64 {
+    if integrator.is_none() { return amount }
+    let (owner, fee_bps) = integrator.unwrap()
+    let fee = ((amount as u128 * fee_bps as u128) / BPS_SCALE) as u64
+    if fee > 0 {
+        let fees: map<Address, map<Hash, u64>> = mem.load("fees").unwrap_or({})
+        let owner_fees = fees.get(owner).unwrap_or({})
+        owner_fees.insert(asset, owner_fees.get(asset).unwrap_or(0) + fee)
+        fees.insert(owner, owner_fees)
+        mem.store("fees", fees)
+    }
+    return amount - fee
+}
+
+// Flush accumulated fees to persistent storage
+fn flush_integrator_fees(mem: MemoryStorage) {
+    let fees: map<Address, map<Hash, u64>> = mem.load("fees").unwrap_or({})
+    let storage = Storage::new()
+    let owners = fees.keys()
+    
+    for i: u32 = 0; i < owners.len(); i += 1 {
+        let owner = owners[i]
+        let owner_fees = fees.get(owner).unwrap()
+        let key = ("bal", owner)
+        let balances: map<Hash, u64> = storage.load(key).unwrap_or({})
+        let assets = owner_fees.keys()
+        
+        for j: u32 = 0; j < assets.len(); j += 1 {
+            let asset = assets[j]
+            balances.insert(asset, balances.get(asset).unwrap_or(0) + owner_fees.get(asset).unwrap())
+        }
+        
+        storage.store(key, balances)
     }
 }
 
@@ -165,10 +204,12 @@ fn match_orders(mem: MemoryStorage, pending: PendingOrder) -> u64 {
         // Using ceiling ensures we never underpay the maker
         let give = ((receive_u256 * p + r - 1) / r) as u64
 
-        // Execute trade: transfer assets between taker (pending.maker) and maker (order.maker)
-        // Taker receives 'receive' of wanted asset, maker receives 'give' of offered asset
-        require(transfer(pending.maker, receive, pending.asset_wanted), "transfer failed")
-        require(transfer(order.maker, give, pending.asset_offered), "transfer failed")
+        // Execute trade: transfer assets between taker and maker, applying integrator fees
+        let taker_receive = apply_fee(mem, pending.integrator, receive, pending.asset_wanted)
+        let maker_receive = apply_fee(mem, order.integrator, give, pending.asset_offered)
+
+        require(transfer(pending.maker, taker_receive, pending.asset_wanted), "transfer failed")
+        require(transfer(order.maker, maker_receive, pending.asset_offered), "transfer failed")
         remaining -= give
 
         // Record trade (create pair id only if a trade actually happens)
@@ -197,7 +238,8 @@ fn match_orders(mem: MemoryStorage, pending: PendingOrder) -> u64 {
                     id: order.id,
                     maker: order.maker,
                     rem_offered: new_rem,
-                    expiry: order.expiry
+                    expiry: order.expiry,
+                    integrator: order.integrator
                 }
                 counter_tree.insert(counter_price.to_be_bytes() + order.id.to_be_bytes(), updated)
             }
@@ -225,7 +267,8 @@ fn process_single_order(mem: MemoryStorage, order: PendingOrder) {
                 id: order_id,
                 maker: order.maker,
                 rem_offered: remaining,
-                expiry: order.expiry
+                expiry: order.expiry,
+                integrator: order.integrator
             }
             let bt = BTreeStore::new(pair_id.to_be_bytes())
             bt.insert(order.price.to_be_bytes() + order_id.to_be_bytes(), new_order)
@@ -281,13 +324,40 @@ fn execute_batch() -> u64 {
         
         // Process all orders in sorted order
         for i: u32 = 0; i < orders.len(); i += 1 {
-            let order = orders[i]
-            process_single_order(mem, order)
+            process_single_order(mem, orders[i])
         }
         
         flush_trade_history(mem)
+        flush_integrator_fees(mem)
     }
     
+    return 0
+}
+
+// ============================================================================
+// INTEGRATOR FEE WITHDRAWAL
+// ============================================================================
+
+// Withdraw all accumulated integrator fees
+entry WithdrawIntegratorFees() {
+    let caller = get_caller().unwrap()
+    let storage = Storage::new()
+    
+    let key = ("bal", caller)
+    let balances: map<Hash, u64> = storage.load(key).unwrap_or({})
+    
+    require(balances.len() > 0, "No fees to withdraw")
+    
+    let assets = balances.keys()
+    for i: u32 = 0; i < assets.len(); i += 1 {
+        let asset = assets[i]
+        let amount = balances.get(asset).unwrap()
+        if amount > 0 {
+            require(transfer(caller, amount, asset), "Transfer failed")
+        }
+    }
+    
+    storage.delete(key)
     return 0
 }
 
@@ -300,8 +370,10 @@ fn execute_batch() -> u64 {
 // Price is derived from the ratio: price = amount_wanted / amount_deposited (scaled by PRICE_SCALE)
 // Orders are sorted by price (highest first) to ensure fair ordering within each batch.
 // GAS_PER_ORDER must be included over and above normal transaction gas to fund batch execution.
+// integrator: Optional (address, fee_percent) where fee_percent is 1-5000 basis points (100 = 1%, max 5000 = 50%).
+//             Fee is deducted from the received amount when the order trades.
 
-entry Order(asset_wanted: Hash, amount_wanted: u64, place_on_book: bool, expiry: optional<u64>) {
+entry Order(asset_wanted: Hash, amount_wanted: u64, place_on_book: bool, expiry: optional<u64>, integrator: optional<(Address, u16)>) {
     let maker = get_caller().unwrap()
     let now = get_current_topoheight()
     let deposits = get_deposits()
@@ -317,6 +389,12 @@ entry Order(asset_wanted: Hash, amount_wanted: u64, place_on_book: bool, expiry:
     let price: u128 = (amount_wanted as u128 * PRICE_SCALE as u128 + amount_offered as u128 - 1) / amount_offered as u128
     require(price > 0, "Price too small - increase amount_wanted or decrease deposit")
     
+    // Validate integrator fee if provided
+    if integrator.is_some() {
+        let (_, fee_bps) = integrator.unwrap()
+        require(fee_bps > 0 && fee_bps <= 5000, "Integrator fee must be 1-5000")
+    }
+    
     // Use persistent memory storage (survives to block end)
     let mem = MemoryStorage::new(true)
     
@@ -330,7 +408,8 @@ entry Order(asset_wanted: Hash, amount_wanted: u64, place_on_book: bool, expiry:
         price: price,
         place_on_book: place_on_book,
         expiry: exp,
-        sort_key: build_sort_key(place_on_book, price)
+        sort_key: build_sort_key(place_on_book, price),
+        integrator: integrator
     })
     mem.store("pending_count", count + 1)
     
