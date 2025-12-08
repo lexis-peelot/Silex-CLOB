@@ -40,16 +40,17 @@ struct PendingOrder {
     price: u128,
     place_on_book: bool,
     expiry: u64,  // 0 = never
-    sort_key: bytes,  // Precomputed at insertion: phase + desc_price
+    sort_key: bytes,  // phase + inv_price
     integrator: optional<(Address, u16)>  // (recipient, fee_bps)
 }
 
 // Build sort key: place_on_book (phase) + price
 // - Phase 1: place_on_book=true orders (takers that place remainder on book)
 // - Phase 0: place_on_book=false orders (takers that refund remainder)
-// - Sorted descending: Phase 1 first, then Phase 0; within each phase, descending price (highest first)
+// - Sorted descending: Phase 1 first, then Phase 0; within each phase,
+//   price aggressiveness: lower price first (encode as inv_price = MAX - price)
 fn build_sort_key(place_on_book: bool, price: u128) -> bytes {
-    return (place_on_book as u8).to_be_bytes() + price.to_be_bytes()
+    return (place_on_book as u8).to_be_bytes() + (u128::MAX - price).to_be_bytes()
 }
 
 // Unfillable = no integer give exists such that 1 <= floor(give*R/price) <= rem
@@ -252,7 +253,6 @@ fn match_orders(mem: MemoryStorage, pending: PendingOrder) -> u64 {
 }
 
 // Process a single order in batch execution
-// Slippage protection comes from price-priority ordering instead.
 fn process_single_order(mem: MemoryStorage, order: PendingOrder) {
     // Match against counter-orders
     let remaining = match_orders(mem, order)
@@ -319,7 +319,7 @@ fn execute_batch() -> u64 {
             orders.push(mem.load(("pending", i)).unwrap())
         }
         
-        // Sort by precomputed key: phase (place_on_book first) then descending price - O(n log n)
+        // Sort descending by precomputed key: makers first, then lowest price (most aggressive)
         orders.sort_by_key(|o: PendingOrder| { return o.sort_key }, false)
         
         // Process all orders in sorted order
