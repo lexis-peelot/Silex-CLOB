@@ -24,7 +24,7 @@ struct TradeEvent {
 
 // Order structure stored in btree values
 struct Order {
-    id: u64,
+    id: u32,
     maker: Address,
     rem_offered: u64,
     expiry: u64,  // topoheight at which order expires; 0 = never expires
@@ -67,8 +67,8 @@ fn is_unfillable(rem: u64, price: u128) -> bool {
 }
 
 // Get next order ID (auto-initializes to 1 if not set)
-fn get_next_order_id(storage: Storage) -> u64 {
-    let next_id: u64 = storage.load("order_id").unwrap_or(1)
+fn get_next_order_id(storage: Storage) -> u32 {
+    let next_id: u32 = storage.load("order_id").unwrap_or(1)
     storage.store("order_id", next_id + 1)
     return next_id
 }
@@ -279,7 +279,7 @@ fn process_single_order(mem: MemoryStorage, order: PendingOrder) {
 }
 
 // Cancel orders in one tree
-fn cancel_orders(order_id: optional<u64>, caller: Address, offered: Hash, wanted: Hash) -> bool {
+fn cancel_orders(order_id: optional<u32>, caller: Address, offered: Hash, wanted: Hash) -> bool {
     let storage = Storage::new()
     let pair_id: optional<u32> = storage.load(("pair", offered, wanted))
     let found = false
@@ -433,7 +433,7 @@ entry Order(asset_wanted: Hash, amount_wanted: u64, place_on_book: bool, expiry:
 // for MEV resistance: once submitted, you're committed until block end.
 // This prevents block producers from seeing all orders then cancelling their own.
 
-entry Cancel(order_id: u64, asset1: Hash, asset2: Hash) {
+entry Cancel(order_id: u32, asset1: Hash, asset2: Hash) {
     let caller = get_caller().unwrap()
     require(
         cancel_orders(order_id, caller, asset1, asset2) ||
