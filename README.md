@@ -19,7 +19,7 @@ A permissionless, trustless, distributed decentralized exchange (DEX) contract f
 
 All orders submitted during a block are collected and executed together at the end of the block. This ensures:
 
-1. **Fair Ordering**: Orders are sorted by price (highest first) within each batch
+1. **Fair Ordering**: Orders are sorted by price aggressiveness (most aggressive first) within each batch
 2. **MEV Resistance**: Block producers cannot see pending orders and manipulate execution
 3. **Price Priority**: Better prices execute first, ensuring optimal fills
 
@@ -36,7 +36,7 @@ Orders are matched against existing counter-orders (orders in the opposite direc
 
 Orders are stored in B-trees keyed by:
 - Price (u128, big-endian)
-- Order ID (u64, big-endian)
+- Order ID (u32, big-endian)
 
 This enables efficient price-ordered traversal for matching.
 
@@ -85,7 +85,7 @@ Order(
 Cancel a specific order by ID.
 
 **Parameters:**
-- `order_id: u64` - The ID of the order to cancel
+- `order_id: u32` - The ID of the order to cancel
 - `asset1: Hash` - First asset in the pair
 - `asset2: Hash` - Second asset in the pair
 
@@ -160,9 +160,9 @@ If a user buys 1000 USDT with an integrator fee of 100 bps (1%):
 
 ### Price Scale
 
-- `PRICE_SCALE = 10^12` (12 decimals)
-- Prices are stored as `u128` values scaled by `PRICE_SCALE`
-- Price formula: `price = (amount_wanted * PRICE_SCALE) / amount_offered`
+- `PRICE_SCALE: u64 = 10^12` (12 decimals)
+- Prices are computed as `u128` values scaled by `PRICE_SCALE`
+- Price formula (ceiling): `price = (amount_wanted * PRICE_SCALE + amount_offered - 1) / amount_offered`
 
 ### Basis Points Scale
 
@@ -203,11 +203,11 @@ The contract fires events for each executed trade, which can be subscribed to vi
 Orders are sorted by a precomputed key:
 - **Phase 1**: `place_on_book=true` orders (remainder goes to book)
 - **Phase 0**: `place_on_book=false` orders (remainder refunded)
-- Within each phase: descending price (highest first)
+- Within each phase: ascending price (lowest/most aggressive first)
 
 This ensures:
 - Orders that add liquidity to the book execute first
-- Better prices execute before worse prices
+- More aggressive prices execute before less aggressive prices
 
 ## Security Considerations
 
